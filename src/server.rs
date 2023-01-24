@@ -21,7 +21,7 @@ impl timestamp::Service for TimestampOracle {
     // example get_timestamp RPC handler.
     async fn get_timestamp(&self, _: TimestampRequest) -> labrpc::Result<TimestampResponse> {
         // Your code here.
-        unimplemented!()
+        Ok(TimestampResponse {})
     }
 }
 
