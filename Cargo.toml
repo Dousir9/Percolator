@@ -14,6 +14,8 @@ futures-timer = "3.0"
 log = "0.4"
 prost = "0.11.6"
 prost-derive = "0.11.6"
+comfy-table = "6.1.4"
+itertools = "0.10.5"
 
 labrpc = { path = "./labrpc" }
 labcodec = { path = "./labcodec" }

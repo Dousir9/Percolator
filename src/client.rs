@@ -203,10 +203,9 @@ impl Client {
             return Ok(false);
         }
 
+        // primary commit 成功则事务提交成功，无需检查 secondary 成功与否
         for secondary in secondaries {
-            if !self.inner_commit(start_ts, commit_ts, secondary.0.to_vec(), false)? {
-                return Ok(false);
-            }
+            self.inner_commit(start_ts, commit_ts, secondary.0.to_vec(), false)?;
         }
 
         Ok(true)

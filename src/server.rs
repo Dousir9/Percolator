@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
+use std::fmt::Display;
+
+use itertools::Itertools;
 
 use crate::msg::*;
 use crate::service::*;
@@ -134,6 +137,55 @@ impl KvTable {
         };
         map.remove(&(key, commit_ts));
     }
+
+    #[inline]
+    fn find_write(&self, key: Vec<u8>, start_ts: u64) -> Option<u64> {
+        self.write
+            .range(..)
+            .find(|(_, ts)| ts.as_ts() == start_ts)
+            .map(|((_, ts), _)| *ts)
+    }
+}
+
+impl Display for KvTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = BTreeMap::<&[u8], BTreeMap<u64, (_, _, _)>>::new();
+        for ((key, ts), value) in &self.data {
+            map.entry(key).or_default().entry(*ts).or_default().0 = Some(value);
+        }
+        for ((key, ts), value) in &self.lock {
+            map.entry(key).or_default().entry(*ts).or_default().1 = Some(value);
+        }
+        for ((key, ts), value) in &self.write {
+            map.entry(key).or_default().entry(*ts).or_default().2 = Some(value);
+        }
+
+        let mut table = comfy_table::Table::new();
+        table.set_header(vec!["Key", "Data", "Lock", "Write"]);
+        for (key, map) in map {
+            let value_to_string = |ts: u64, v: Option<&Value>| match v {
+                Some(Value::Timestamp(t)) => format!("{ts}: data@{t}"),
+                Some(Value::Vector(v)) => format!("{ts}: {}", String::from_utf8_lossy(v)),
+                None => String::new(),
+            };
+            table.add_row(vec![
+                String::from_utf8_lossy(key).to_string(),
+                map.iter()
+                    .rev()
+                    .map(|(ts, (v, _, _))| value_to_string(*ts, *v))
+                    .join("\n"),
+                map.iter()
+                    .rev()
+                    .map(|(ts, (_, v, _))| value_to_string(*ts, *v))
+                    .join("\n"),
+                map.iter()
+                    .rev()
+                    .map(|(ts, (_, _, v))| value_to_string(*ts, *v))
+                    .join("\n"),
+            ]);
+        }
+        write!(f, "{table}")
+    }
 }
 
 // MemoryStorage is used to wrap a KvTable.
@@ -155,9 +207,16 @@ impl transaction::Service for MemoryStorage {
                 table.read(req.key.to_vec(), Column::Lock, ..=req.start_ts)
             {
                 // Err IsLocked
-                error!(
+                info!(
                     "[IsLocked] start_ts = {}, primary = {:?}",
                     start_ts, primary
+                );
+                let primary = primary.clone();
+                drop(table);
+                self.back_off_maybe_clean_up_lock(
+                    start_ts,
+                    req.key.clone(),
+                    primary.as_bytes().to_vec(),
                 );
                 continue;
             }
@@ -180,17 +239,16 @@ impl transaction::Service for MemoryStorage {
 
     // example prewrite RPC handler.
     async fn prewrite(&self, req: PrewriteRequest) -> labrpc::Result<PrewriteResponse> {
-        // Your code here.
         // 检查 write-write 冲突
         let mut table = self.data.lock().unwrap();
         if let Some((commit_ts, _)) = table.read(req.key.to_vec(), Column::Write, req.start_ts..) {
-            error!("[WriteConflict] commit_ts = {}", commit_ts);
+            info!("[WriteConflict] commit_ts = {}", commit_ts);
             return Ok(PrewriteResponse { success: false });
         }
 
         // 检查 key 是否被加锁
         if let Some((start_ts, _)) = table.read(req.key.to_vec(), Column::Lock, ..) {
-            error!("[IsLocked] start_ts = {}", start_ts);
+            info!("[IsLocked] start_ts = {}", start_ts);
             return Ok(PrewriteResponse { success: false });
         }
 
@@ -210,24 +268,24 @@ impl transaction::Service for MemoryStorage {
             Value::Vector(req.value),
         );
 
+        // print!("{}\n", table);
         Ok(PrewriteResponse { success: true })
     }
 
     // example commit RPC handler.
     async fn commit(&self, req: CommitRequest) -> labrpc::Result<CommitResponse> {
-        // Your code here.
-        let mut kvtable = self.data.lock().unwrap();
+        let mut table = self.data.lock().unwrap();
         // 检查 lock 的合法性
-        if let Some((start_ts, primary)) = kvtable.read(req.key.to_vec(), Column::Lock, ..) {
+        if let Some((start_ts, primary)) = table.read(req.key.to_vec(), Column::Lock, ..) {
             if start_ts != req.start_ts || (req.is_primary && primary.as_bytes() != &req.key) {
-                error!(
+                info!(
                     "[InvalidLock] start_ts = {}, primary = {:?}",
                     start_ts, primary
                 );
                 return Ok(CommitResponse { success: false });
             }
         } else {
-            error!(
+            info!(
                 "[LockNotExist] start_ts = {}, key = {:?}",
                 req.start_ts, req.key
             );
@@ -235,7 +293,7 @@ impl transaction::Service for MemoryStorage {
         }
 
         // 写 write 列
-        kvtable.write(
+        table.write(
             req.key.to_vec(),
             Column::Write,
             req.commit_ts,
@@ -243,16 +301,37 @@ impl transaction::Service for MemoryStorage {
         );
 
         // 删除 key 的 lock
-        kvtable.erase(req.key, Column::Lock, req.start_ts);
+        table.erase(req.key, Column::Lock, req.start_ts);
 
+        // print!("{}\n", table);
         Ok(CommitResponse { success: true })
     }
 }
 
 impl MemoryStorage {
-    fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
-        // Your code here.
-        thread::sleep(Duration::from_millis(TTL));
-        unimplemented!()
+    fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>, primary: Vec<u8>) {
+        thread::sleep(Duration::from_nanos(TTL));
+        let mut table = self.data.lock().unwrap();
+        if let None = table.read(key.clone(), Column::Lock, ..) {
+            // lock 被拥有者清除了
+            return;
+        }
+        // 检查 primary 是否 commit 成功来决定 roll back 还是 roll forward
+        match table.find_write(primary.clone(), start_ts) {
+            Some(commit_ts) => {
+                // commit 成功，roll forward
+                table.write(
+                    key.clone(),
+                    Column::Write,
+                    commit_ts,
+                    Value::Timestamp(start_ts),
+                );
+                table.erase(key, Column::Lock, start_ts);
+            }
+            None => {
+                // commit 失败，roll back
+                table.erase(key, Column::Lock, start_ts);
+            }
+        }
     }
 }
