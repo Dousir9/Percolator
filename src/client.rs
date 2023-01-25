@@ -153,6 +153,12 @@ impl Client {
                     Error::Timeout => thread::sleep(time::Duration::from_millis(
                         ((1 << i) * BACKOFF_TIME_MS) as u64,
                     )),
+                    Error::Other(s) => {
+                        if s == "reqhook" {
+                            return Ok(false);
+                        }
+                        return Err(Error::Other(s));
+                    }
                     other => return Err(other),
                 },
             }

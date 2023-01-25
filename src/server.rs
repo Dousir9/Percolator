@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::ops::Bound::Included;
+use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::thread;
 
 use crate::msg::*;
 use crate::service::*;
@@ -39,6 +40,23 @@ pub enum Value {
     Vector(Vec<u8>),
 }
 
+// 将 match 逻辑搬到这里
+impl Value {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Vector(bytes) => bytes,
+            _ => panic!("expect vector"),
+        }
+    }
+
+    fn as_ts(&self) -> u64 {
+        match self {
+            Self::Timestamp(ts) => *ts,
+            _ => panic!("expect timestamp"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Write(Vec<u8>, Vec<u8>);
 
@@ -65,22 +83,32 @@ impl KvTable {
         &self,
         key: Vec<u8>,
         column: Column,
-        ts_start_inclusive: Option<u64>,
-        ts_end_inclusive: Option<u64>,
-    ) -> Option<(&Key, &Value)> {
-        // Your code here.
-        let ts_start_inclusive = ts_start_inclusive.unwrap_or(0);
-        let ts_end_inclusive = ts_end_inclusive.unwrap_or(u64::MAX);
+        ts_range: impl RangeBounds<u64>,
+    ) -> Option<(u64, &Value)> {
         let map = match column {
             Column::Write => &self.write,
             Column::Data => &self.data,
             Column::Lock => &self.lock,
         };
-        map.range((
-            Included((key.clone(), ts_start_inclusive)),
-            Included((key, ts_end_inclusive)),
-        ))
-        .last()
+        let start = (
+            key.clone(),
+            match ts_range.start_bound() {
+                Bound::Included(ts) => *ts,
+                Bound::Excluded(ts) => *ts + 1,
+                Bound::Unbounded => 0,
+            },
+        );
+        let end = (
+            key.clone(),
+            match ts_range.end_bound() {
+                Bound::Included(ts) => *ts,
+                Bound::Excluded(ts) => *ts - 1,
+                Bound::Unbounded => u64::MAX,
+            },
+        );
+        map.range(start..=end)
+            .next_back()
+            .map(|((_, ts), value)| (*ts, value))
     }
 
     // Writes a record to a specified column in MemoryStorage.
@@ -121,37 +149,32 @@ impl transaction::Service for MemoryStorage {
     async fn get(&self, req: GetRequest) -> labrpc::Result<GetResponse> {
         // Your code here.
         loop {
-            let kvtable = self.data.lock().unwrap();
+            let table = self.data.lock().unwrap();
             // 检查 [0, start_ts] 是否有有锁
-            if kvtable
-                .read(req.key.to_vec(), Column::Lock, Some(0), Some(req.start_ts))
-                .is_some()
+            if let Some((start_ts, primary)) =
+                table.read(req.key.to_vec(), Column::Lock, ..=req.start_ts)
             {
+                // Err IsLocked
+                error!(
+                    "[IsLocked] start_ts = {}, primary = {:?}",
+                    start_ts, primary
+                );
                 continue;
             }
             // 通过 write 列找到 start_ts 可以看到的 key 的最新提交版本
-            match kvtable.read(req.key.to_vec(), Column::Write, None, Some(req.start_ts)) {
-                Some(write) => {
-                    // 根据版本读取数据
-                    if let Value::Timestamp(data_ts) = write.1 {
-                        if let Value::Vector(value) = kvtable
-                            .read(
-                                req.key.to_vec(),
-                                Column::Data,
-                                Some(*data_ts),
-                                Some(data_ts.clone()),
-                            )
-                            .unwrap()
-                            .1
-                        {
-                            return Ok(GetResponse {
-                                value: value.to_vec(),
-                            });
-                        }
-                    }
-                }
+            let data_ts = match table.read(req.key.to_vec(), Column::Write, 0..=req.start_ts) {
+                Some(write) => write.1.as_ts(),
                 None => return Ok(GetResponse { value: vec![] }),
-            }
+            };
+            // 根据版本读取数据
+            let value = table
+                .read(req.key.to_vec(), Column::Data, data_ts..=data_ts.clone())
+                .unwrap()
+                .1
+                .as_bytes();
+            return Ok(GetResponse {
+                value: value.to_vec(),
+            });
         }
     }
 
@@ -159,24 +182,20 @@ impl transaction::Service for MemoryStorage {
     async fn prewrite(&self, req: PrewriteRequest) -> labrpc::Result<PrewriteResponse> {
         // Your code here.
         // 检查 write-write 冲突
-        let mut kvtable = self.data.lock().unwrap();
-        if kvtable
-            .read(req.key.to_vec(), Column::Write, Some(req.start_ts), None)
-            .is_some()
-        {
+        let mut table = self.data.lock().unwrap();
+        if let Some((commit_ts, _)) = table.read(req.key.to_vec(), Column::Write, req.start_ts..) {
+            error!("[WriteConflict] commit_ts = {}", commit_ts);
             return Ok(PrewriteResponse { success: false });
         }
 
         // 检查 key 是否被加锁
-        if kvtable
-            .read(req.key.to_vec(), Column::Lock, None, None)
-            .is_some()
-        {
+        if let Some((start_ts, _)) = table.read(req.key.to_vec(), Column::Lock, ..) {
+            error!("[IsLocked] start_ts = {}", start_ts);
             return Ok(PrewriteResponse { success: false });
         }
 
         // 为 key 加锁
-        kvtable.write(
+        table.write(
             req.key.to_vec(),
             Column::Lock,
             req.start_ts,
@@ -184,7 +203,7 @@ impl transaction::Service for MemoryStorage {
         );
 
         // 写 data 列
-        kvtable.write(
+        table.write(
             req.key,
             Column::Data,
             req.start_ts,
@@ -199,21 +218,20 @@ impl transaction::Service for MemoryStorage {
         // Your code here.
         let mut kvtable = self.data.lock().unwrap();
         // 检查 lock 的合法性
-        match kvtable.read(req.key.to_vec(), Column::Lock, None, None) {
-            Some(lock) => {
-                let key_and_start_ts = lock.0;
-                if key_and_start_ts.1 != req.start_ts {
-                    return Ok(CommitResponse { success: false });
-                }
-                if req.is_primary {
-                    if let Value::Vector(primary) = lock.1 {
-                        if primary != &req.key {
-                            return Ok(CommitResponse { success: false });
-                        }
-                    }
-                }
+        if let Some((start_ts, primary)) = kvtable.read(req.key.to_vec(), Column::Lock, ..) {
+            if start_ts != req.start_ts || (req.is_primary && primary.as_bytes() != &req.key) {
+                error!(
+                    "[InvalidLock] start_ts = {}, primary = {:?}",
+                    start_ts, primary
+                );
+                return Ok(CommitResponse { success: false });
             }
-            None => return Ok(CommitResponse { success: false }),
+        } else {
+            error!(
+                "[LockNotExist] start_ts = {}, key = {:?}",
+                req.start_ts, req.key
+            );
+            return Ok(CommitResponse { success: false });
         }
 
         // 写 write 列
@@ -234,6 +252,7 @@ impl transaction::Service for MemoryStorage {
 impl MemoryStorage {
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
         // Your code here.
+        thread::sleep(Duration::from_millis(TTL));
         unimplemented!()
     }
 }
